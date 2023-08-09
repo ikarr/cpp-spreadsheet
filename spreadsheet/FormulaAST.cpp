@@ -1,13 +1,12 @@
 #include "FormulaAST.h"
-
 #include "FormulaBaseListener.h"
 #include "FormulaLexer.h"
 #include "FormulaParser.h"
 
 #include <cassert>
 #include <cmath>
+#include <functional>
 #include <memory>
-#include <optional>
 #include <sstream>
 
 namespace ASTImpl {
@@ -30,34 +29,36 @@ enum PrecedenceRule {
     PR_BOTH = PR_LEFT | PR_RIGHT,  // needed for both children
 };
 
-// PRECEDENCE_RULES[parent][child] determines if parentheses need
-// to be inserted between a parent and a child of specific precedences;
-// for some nodes rules are different for left and right children:
-// (X c Y) p Z  vs  X p (Y c Z)
-//
-// The interesting cases are the ones where removing the parens would change the AST.
-// It may happen when our precedence rules for parentheses are different from
-// the grammatic precedence of operations.
-//
-// Case analysis:
-// A + (B + C) - always okay (nothing of lower grammatic precedence could have been written to the
-// right)
-//    (e.g. if we had A + (B + C) / D, it wouldn't parse in a way
-//    that woudld have given us A + (B + C) as a subexpression to deal with)
-// A + (B - C) - always okay (nothing of lower grammatic precedence could have been written to the
-// right) A - (B + C) - never okay A - (B - C) - never okay A * (B * C) - always okay (the parent
-// has the highest grammatic precedence) A * (B / C) - always okay (the parent has the highest
-// grammatic precedence) A / (B * C) - never okay A / (B / C) - never okay
-// -(A + B) - never okay
-// -(A - B) - never okay
-// -(A * B) - always okay (the resulting binary op has the highest grammatic precedence)
-// -(A / B) - always okay (the resulting binary op has the highest grammatic precedence)
-// +(A + B) - **sometimes okay** (e.g. parens in +(A + B) / C are **not** optional)
-//     (currently in the table we're always putting in the parentheses)
-// +(A - B) - **sometimes okay** (same)
-//     (currently in the table we're always putting in the parentheses)
-// +(A * B) - always okay (the resulting binary op has the highest grammatic precedence)
-// +(A / B) - always okay (the resulting binary op has the highest grammatic precedence)
+/*
+PRECEDENCE_RULES[parent][child] determines if parentheses need
+to be inserted between a parent and a child of specific precedences;
+for some nodes rules are different for left and right children:
+(X c Y) p Z  vs  X p (Y c Z)
+
+The interesting cases are the ones where removing the parens would change the AST.
+It may happen when our precedence rules for parentheses are different from
+the grammatic precedence of operations.
+
+Case analysis:
+A + (B + C) - always okay (nothing of lower grammatic precedence could have been written to the
+right)
+(e.g. if we had A + (B + C) / D, it wouldn't parse in a way
+that woudld have given us A + (B + C) as a subexpression to deal with)
+A + (B - C) - always okay (nothing of lower grammatic precedence could have been written to the
+right) A - (B + C) - never okay A - (B - C) - never okay A * (B * C) - always okay (the parent
+has the highest grammatic precedence) A * (B / C) - always okay (the parent has the highest
+grammatic precedence) A / (B * C) - never okay A / (B / C) - never okay
+-(A + B) - never okay
+-(A - B) - never okay
+-(A * B) - always okay (the resulting binary op has the highest grammatic precedence)
+-(A / B) - always okay (the resulting binary op has the highest grammatic precedence)
++(A + B) - **sometimes okay** (e.g. parens in +(A + B) / C are **not** optional)
+    (currently in the table we're always putting in the parentheses)
++(A - B) - **sometimes okay** (same)
+    (currently in the table we're always putting in the parentheses)
++(A * B) - always okay (the resulting binary op has the highest grammatic precedence)
++(A / B) - always okay (the resulting binary op has the highest grammatic precedence)
+*/
 constexpr PrecedenceRule PRECEDENCE_RULES[EP_END][EP_END] = {
     /* EP_ADD */ {PR_NONE, PR_NONE, PR_NONE, PR_NONE, PR_NONE, PR_NONE},
     /* EP_SUB */ {PR_RIGHT, PR_RIGHT, PR_NONE, PR_NONE, PR_NONE, PR_NONE},
@@ -66,19 +67,18 @@ constexpr PrecedenceRule PRECEDENCE_RULES[EP_END][EP_END] = {
     /* EP_UNARY */ {PR_BOTH, PR_BOTH, PR_NONE, PR_NONE, PR_NONE, PR_NONE},
     /* EP_ATOM */ {PR_NONE, PR_NONE, PR_NONE, PR_NONE, PR_NONE, PR_NONE},
 };
-
+    
 class Expr {
 public:
     virtual ~Expr() = default;
     virtual void Print(std::ostream& out) const = 0;
     virtual void DoPrintFormula(std::ostream& out, ExprPrecedence precedence) const = 0;
-    virtual double Evaluate(/*добавьте сюда нужные аргументы*/ args) const = 0;
+    virtual double Evaluate(LookupValue lookup_value) const = 0;
 
     // higher is tighter
     virtual ExprPrecedence GetPrecedence() const = 0;
 
-    void PrintFormula(std::ostream& out, ExprPrecedence parent_precedence,
-                      bool right_child = false) const {
+    void PrintFormula(std::ostream& out, ExprPrecedence parent_precedence, bool right_child = false) const {
         auto precedence = GetPrecedence();
         auto mask = right_child ? PR_RIGHT : PR_LEFT;
         bool parens_needed = PRECEDENCE_RULES[parent_precedence][precedence] & mask;
@@ -93,8 +93,9 @@ public:
         }
     }
 };
-
+    
 namespace {
+        
 class BinaryOpExpr final : public Expr {
 public:
     enum Type : char {
@@ -104,12 +105,8 @@ public:
         Divide = '/',
     };
 
-public:
     explicit BinaryOpExpr(Type type, std::unique_ptr<Expr> lhs, std::unique_ptr<Expr> rhs)
-        : type_(type)
-        , lhs_(std::move(lhs))
-        , rhs_(std::move(rhs)) {
-    }
+        : type_(type), lhs_(std::move(lhs)), rhs_(std::move(rhs)) {}
 
     void Print(std::ostream& out) const override {
         out << '(' << static_cast<char>(type_) << ' ';
@@ -142,8 +139,35 @@ public:
         }
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/) const override {
-			// Скопируйте ваше решение из предыдущих уроков.
+    // Метод Evaluate() для бинарных операций.
+    // При делении на 0 выбрасывает ошибку вычисления FormulaError
+    double Evaluate(LookupValue lookup_value) const override {
+        double res;
+
+        switch (type_) {
+            case Type::Add: {
+                res = lhs_->Evaluate(lookup_value) + rhs_->Evaluate(lookup_value);
+                break;
+            }
+            case Type::Subtract: {
+                res = lhs_->Evaluate(lookup_value) - rhs_->Evaluate(lookup_value);
+                break;
+            }
+            case Type::Multiply: {
+                res = lhs_->Evaluate(lookup_value) * rhs_->Evaluate(lookup_value);
+                break;
+            }
+            case Type::Divide: {
+                res = lhs_->Evaluate(lookup_value) / rhs_->Evaluate(lookup_value);
+                break;
+            }
+            default:
+                assert(false);
+        }
+        if (!std::isfinite(res)) {
+            throw FormulaError(FormulaError::Category::Div0);
+        }
+        return res;
     }
 
 private:
@@ -159,11 +183,8 @@ public:
         UnaryMinus = '-',
     };
 
-public:
     explicit UnaryOpExpr(Type type, std::unique_ptr<Expr> operand)
-        : type_(type)
-        , operand_(std::move(operand)) {
-    }
+        : type_(type), operand_(std::move(operand)) {}
 
     void Print(std::ostream& out) const override {
         out << '(' << static_cast<char>(type_) << ' ';
@@ -180,8 +201,16 @@ public:
         return EP_UNARY;
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/ args) const override {
-        // Скопируйте ваше решение из предыдущих уроков.
+    // Метод Evaluate() для унарных операций.
+    double Evaluate(LookupValue lookup_value) const override {
+        switch (type_) {
+            case Type::UnaryPlus:
+                return +operand_->Evaluate(lookup_value);
+            case Type::UnaryMinus:
+                return -operand_->Evaluate(lookup_value);
+            default:
+                assert(false);
+        }
     }
 
 private:
@@ -189,11 +218,36 @@ private:
     std::unique_ptr<Expr> operand_;
 };
 
+class NumberExpr final : public Expr {
+public:
+    explicit NumberExpr(double value)
+        : value_(value) {}
+
+    void Print(std::ostream& out) const override {
+        out << value_;
+    }
+
+    void DoPrintFormula(std::ostream& out, ExprPrecedence /* precedence */) const override {
+        out << value_;
+    }
+
+    ExprPrecedence GetPrecedence() const override {
+        return EP_ATOM;
+    }
+
+    // Для чисел метод возвращает значение числа.
+    double Evaluate(LookupValue /*lookup_value*/) const override {
+        return value_;
+    }
+
+private:
+    double value_;
+};
+
 class CellExpr final : public Expr {
 public:
     explicit CellExpr(const Position* cell)
-        : cell_(cell) {
-    }
+        : cell_(cell) {}
 
     void Print(std::ostream& out) const override {
         if (!cell_->IsValid()) {
@@ -211,47 +265,24 @@ public:
         return EP_ATOM;
     }
 
-    double Evaluate(/*добавьте нужные аргументы*/ args) const override {
-        // реализуйте метод.
+    double Evaluate(LookupValue lookup_value) const override {
+        assert(lookup_value.has_value());
+        return lookup_value.value()(*cell_);
     }
 
 private:
     const Position* cell_;
+    std::function<double(Position)> lookup_value_func_;
+    std::optional<FormulaError> error_;
 };
-
-class NumberExpr final : public Expr {
-public:
-    explicit NumberExpr(double value)
-        : value_(value) {
-    }
-
-    void Print(std::ostream& out) const override {
-        out << value_;
-    }
-
-    void DoPrintFormula(std::ostream& out, ExprPrecedence /* precedence */) const override {
-        out << value_;
-    }
-
-    ExprPrecedence GetPrecedence() const override {
-        return EP_ATOM;
-    }
-
-    double Evaluate(/*добавьте нужные аргументы*/ args) const override {
-        return value_;
-    }
-
-private:
-    double value_;
-};
-
+    
 class ParseASTListener final : public FormulaBaseListener {
 public:
     std::unique_ptr<Expr> MoveRoot() {
         assert(args_.size() == 1);
         auto root = std::move(args_.front());
         args_.clear();
-
+        
         return root;
     }
 
@@ -259,7 +290,6 @@ public:
         return std::move(cells_);
     }
 
-public:
     void exitUnaryOp(FormulaParser::UnaryOpContext* ctx) override {
         assert(args_.size() >= 1);
 
@@ -334,19 +364,18 @@ private:
     std::vector<std::unique_ptr<Expr>> args_;
     std::forward_list<Position> cells_;
 };
-
+        
 class BailErrorListener : public antlr4::BaseErrorListener {
 public:
-    void syntaxError(antlr4::Recognizer* /* recognizer */, antlr4::Token* /* offendingSymbol */,
-                     size_t /* line */, size_t /* charPositionInLine */, const std::string& msg,
-                     std::exception_ptr /* e */
-                     ) override {
+    void syntaxError(
+        antlr4::Recognizer* /* recognizer */, antlr4::Token* /* offendingSymbol */, size_t /* line */, size_t /* charPositionInLine */,
+        const std::string& msg, std::exception_ptr /* e */
+    ) override {
         throw ParsingError("Error when lexing: " + msg);
     }
 };
-
-}  // namespace
-}  // namespace ASTImpl
+} // namespace
+} // namespace ASTImpl
 
 FormulaAST ParseFormulaAST(std::istream& in) {
     using namespace antlr4;
@@ -391,14 +420,21 @@ void FormulaAST::PrintFormula(std::ostream& out) const {
     root_expr_->PrintFormula(out, ASTImpl::EP_ATOM);
 }
 
-double FormulaAST::Execute(/*добавьте нужные аргументы*/ args) const {
-    return root_expr_->Evaluate(/*добавьте нужные аргументы*/ args);
+double FormulaAST::Execute(LookupValue lookup_value) const {
+    return root_expr_->Evaluate(lookup_value);
 }
 
 FormulaAST::FormulaAST(std::unique_ptr<ASTImpl::Expr> root_expr, std::forward_list<Position> cells)
-    : root_expr_(std::move(root_expr))
-    , cells_(std::move(cells)) {
+    : root_expr_(std::move(root_expr)), cells_(std::move(cells)) {
     cells_.sort();  // to avoid sorting in GetReferencedCells
 }
 
 FormulaAST::~FormulaAST() = default;
+
+const std::forward_list<Position>& FormulaAST::GetCells() const {
+    return cells_;
+}
+
+std::forward_list<Position>& FormulaAST::GetCells() {
+    return cells_;
+}
